@@ -7,30 +7,11 @@ export const runtime = 'nodejs'
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, { apiVersion: '2024-06-20' })
 
-// Allow envs to be either price_… OR prod_…
-const ENV_IDS = {
-  Basic: process.env.PRICE_BASIC || '',
-  Pro: process.env.PRICE_PRO || '',
-  Elite: process.env.PRICE_ELITE || '',
-}
-
-type PlanInfo = { plan: 'Basic' | 'Pro' | 'Elite'; limit: string }
-
-function mappingFor(label: keyof typeof ENV_IDS): PlanInfo {
-  if (label === 'Basic') return { plan: 'Basic', limit: '10' }
-  if (label === 'Pro')   return { plan: 'Pro',   limit: '30' }
-  return { plan: 'Elite', limit: 'unlimited' }
-}
-
-function resolvePlan(priceId?: string, productId?: string): PlanInfo | undefined {
-  for (const [label, id] of Object.entries(ENV_IDS) as Array<[keyof typeof ENV_IDS, string]>) {
-    if (!id) continue
-    // exact match on price id
-    if (priceId && id.startsWith('price_') && id === priceId) return mappingFor(label)
-    // exact match on product id
-    if (productId && id.startsWith('prod_') && id === productId) return mappingFor(label)
-  }
-  return undefined
+// Map your Test (or Live) Price IDs to plans
+const PRICE_TO_PLAN: Record<string, { plan: 'Basic' | 'Pro' | 'Elite'; limit: string }> = {
+  [process.env.PRICE_BASIC!]: { plan: 'Basic', limit: '10' },
+  [process.env.PRICE_PRO!]:   { plan: 'Pro',   limit: '30' },
+  [process.env.PRICE_ELITE!]: { plan: 'Elite', limit: 'unlimited' },
 }
 
 export async function POST(req: NextRequest) {
@@ -51,56 +32,57 @@ export async function POST(req: NextRequest) {
     if (event.type === 'checkout.session.completed') {
       const session = event.data.object as Stripe.Checkout.Session
 
-      // Email
-      let email = session.customer_details?.email || (session as any).customer_email || undefined
+      // ---- 1) Get customer email robustly ----
+      let email =
+        session.customer_details?.email ||
+        // older/alternate field Stripe sometimes keeps:
+        (session as any).customer_email ||
+        undefined
+
       if (!email && session.customer) {
         const cust = await stripe.customers.retrieve(session.customer as string)
-        if (!('deleted' in cust)) email = cust.email || undefined
+        if (!('deleted' in cust) && cust.email) email = cust.email
       }
 
-      // Price + Product from the subscription
+      // ---- 2) Get the price ID from the subscription ----
       let priceId: string | undefined
-      let productId: string | undefined
       if (session.mode === 'subscription' && session.subscription) {
         const sub = await stripe.subscriptions.retrieve(session.subscription as string, {
-          expand: ['items.data.price.product'],
+          expand: ['items.data.price'],
         })
-        const item = sub.items.data[0]
-        priceId = item?.price?.id
-        const prod = item?.price?.product as string | Stripe.Product | undefined
-        productId = typeof prod === 'string' ? prod : prod?.id
+        priceId = sub.items.data[0]?.price?.id
       }
 
-      const mapping = resolvePlan(priceId, productId)
+      const mapped = priceId ? PRICE_TO_PLAN[priceId] : undefined
 
-      // 🔎 Debug line you’ll see in Vercel → Logs
-      console.log('WH DEBUG:', { email, priceId, productId, mapping, ENV_IDS })
-
-      if (!email || !mapping) {
-        // return 200 so Stripe doesn’t retry; we just don’t update
-        console.warn('WH WARN: Missing email or mapping. Skipping update.', { email, priceId, productId })
-        return NextResponse.json({ received: true, note: 'missing email or mapping' }, { status: 200 })
+      if (!email || !mapped) {
+        console.warn('Webhook missing email or price mapping', { email, priceId })
+        // Return 200 so Stripe stops retrying (we logged the problem)
+        return NextResponse.json({ received: true }, { status: 200 })
       }
 
+      // ---- 3) Update Supabase user by email ----
       const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!)
 
       const { error } = await supabase
         .from(process.env.SUPABASE_USERS_TABLE || 'users')
         .update({
-          plan: mapping.plan,
-          daily_comp_limit: mapping.limit,
+          plan: mapped.plan,
+          daily_comp_limit: mapped.limit,
         })
         .eq(process.env.SUPABASE_EMAIL_COLUMN || 'email', email)
 
       if (error) {
-        console.error('WH ERROR: Supabase update failed', error)
+        console.error('Supabase update error:', error)
         return NextResponse.json({ error: 'Supabase update failed' }, { status: 500 })
       }
+
+      console.log('WEBHOOK OK:', { email, priceId, plan: mapped.plan })
     }
 
     return NextResponse.json({ received: true }, { status: 200 })
   } catch (err: any) {
-    console.error('WH ERROR:', err)
+    console.error('Webhook handler crash:', err)
     return NextResponse.json({ error: 'Internal webhook handler error' }, { status: 500 })
   }
 }
