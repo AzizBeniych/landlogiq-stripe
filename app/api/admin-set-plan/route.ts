@@ -33,12 +33,16 @@ export async function GET(req: NextRequest) {
   const emailCol = process.env.SUPABASE_EMAIL_COLUMN || 'email'
   const table = process.env.SUPABASE_USERS_TABLE || 'users'
 
-  const { error } = await supabase
-    .from(table)
-    .upsert(
-      { [emailCol]: email, plan: mapping.plan, daily_comp_limit: mapping.limit },
-      { onConflict: emailCol }
-    )
+  const { data, error } = await supabase
+  .from(table)
+  .update({ plan: mapping.plan, daily_comp_limit: mapping.limit })
+  .eq(emailCol, email)
+  .select()
+
+if (error) return NextResponse.json({ ok:false, error }, { status:500 })
+if (!data || data.length === 0) {
+  return NextResponse.json({ ok:false, error:'email_not_found' }, { status:404 })
+}
 
   if (error) return NextResponse.json({ ok: false, error }, { status: 500 })
 
