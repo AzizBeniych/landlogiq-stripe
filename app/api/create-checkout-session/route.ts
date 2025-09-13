@@ -4,7 +4,7 @@ import Stripe from 'stripe'
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, { apiVersion: '2024-06-20' })
 
-// Accepts price_... or prod_... in env
+// We will allow envs that are price_... OR prod_...
 const PLAN_TO_ID: Record<string, string> = {
   basic: process.env.PRICE_BASIC!,
   pro: process.env.PRICE_PRO!,
@@ -16,12 +16,10 @@ async function resolveLineItem(id: string): Promise<Stripe.Checkout.SessionCreat
     return { price: id, quantity: 1 }
   }
   if (id.startsWith('prod_')) {
-    // find an active MONTHLY recurring price for this product
+    // find an active MONTHLY recurring price attached to this product
     const prices = await stripe.prices.list({ product: id, active: true, limit: 20 })
     const monthly = prices.data.find(p => p.recurring?.interval === 'month')
-    if (!monthly) {
-      throw new Error(`No active monthly price for product ${id}`)
-    }
+    if (!monthly) throw new Error(`No active monthly price for product ${id}`)
     return { price: monthly.id, quantity: 1 }
   }
   throw new Error('Invalid ID in env (must start with price_ or prod_)')
@@ -31,7 +29,6 @@ export async function GET(req: NextRequest) {
   try {
     const { searchParams } = new URL(req.url)
     const plan = (searchParams.get('plan') || '').toLowerCase()
-
     if (!['basic', 'pro', 'elite'].includes(plan)) {
       return NextResponse.json({ error: 'Invalid plan' }, { status: 400 })
     }
@@ -54,5 +51,3 @@ export async function GET(req: NextRequest) {
   } catch (err: any) {
     console.error('create-checkout-session error', err)
     return NextResponse.json({ error: err.message || 'Internal error' }, { status: 500 })
-  }
-}
