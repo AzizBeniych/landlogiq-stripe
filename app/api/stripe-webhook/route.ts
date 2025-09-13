@@ -5,7 +5,7 @@ import { createClient } from '@supabase/supabase-js'
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, { apiVersion: '2024-06-20' })
 
-// Env values may be price_... OR prod_...
+// Env IDs may be price_... OR prod_...
 const ENV_IDS = {
   Basic: process.env.PRICE_BASIC!,
   Pro: process.env.PRICE_PRO!,
@@ -14,7 +14,6 @@ const ENV_IDS = {
 
 type PlanInfo = { plan: 'Basic' | 'Pro' | 'Elite'; limit: string }
 
-// given a priceId AND productId from the subscription, decide which plan this is
 function resolvePlan(priceId?: string, productId?: string): PlanInfo | undefined {
   const entries: Array<[keyof typeof ENV_IDS, string]> = Object.entries(ENV_IDS) as any
   for (const [label, id] of entries) {
@@ -32,14 +31,14 @@ function resolvePlan(priceId?: string, productId?: string): PlanInfo | undefined
   return undefined
 }
 
-export const runtime = 'nodejs' // keep Node runtime (not Edge)
+export const runtime = 'nodejs'
 
 export async function POST(req: NextRequest) {
   const sig = req.headers.get('stripe-signature')
   if (!sig) return NextResponse.json({ error: 'Missing signature' }, { status: 400 })
 
   const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET!
-  const body = await req.text() // raw body required for verification
+  const body = await req.text()
 
   let event: Stripe.Event
   try {
@@ -53,10 +52,9 @@ export async function POST(req: NextRequest) {
     if (event.type === 'checkout.session.completed') {
       const session = event.data.object as Stripe.Checkout.Session
 
-      // email to tag in Supabase
       const email = session.customer_details?.email || undefined
 
-      // pull price & product from the created subscription
+      // fetch subscription to get both price and product IDs
       let priceId: string | undefined
       let productId: string | undefined
       if (session.mode === 'subscription' && session.subscription) {
@@ -65,7 +63,6 @@ export async function POST(req: NextRequest) {
         })
         const item = sub.items.data[0]
         priceId = item?.price?.id
-        // price.product can be string or object (we expanded above)
         const prod = item?.price?.product as string | Stripe.Product | undefined
         productId = typeof prod === 'string' ? prod : prod?.id
       }
@@ -79,7 +76,6 @@ export async function POST(req: NextRequest) {
 
       const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!)
 
-      // Upsert so you don't have to pre-create users
       const { error } = await supabase
         .from(process.env.SUPABASE_USERS_TABLE || 'users')
         .upsert(
@@ -98,13 +94,4 @@ export async function POST(req: NextRequest) {
     }
 
     return NextResponse.json({ received: true }, { status: 200 })
-  } catch (err: any) {
-    console.error('Webhook handler error', err)
-    return NextResponse.json({ error: 'Internal webhook error' }, { status: 500 })
-  }
-}
-
-// keep raw body for Stripe signature verification (pages-config style for safety)
-export const config = {
-  api: { bodyParser: false },
-}
+  } cat
