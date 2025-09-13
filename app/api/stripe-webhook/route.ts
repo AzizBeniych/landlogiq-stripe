@@ -3,9 +3,11 @@ import { NextRequest, NextResponse } from 'next/server'
 import Stripe from 'stripe'
 import { createClient } from '@supabase/supabase-js'
 
+export const runtime = 'nodejs'
+
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, { apiVersion: '2024-06-20' })
 
-// Env IDs may be price_... OR prod_...
+// Env IDs can be price_... OR prod_...
 const ENV_IDS = {
   Basic: process.env.PRICE_BASIC!,
   Pro: process.env.PRICE_PRO!,
@@ -15,7 +17,7 @@ const ENV_IDS = {
 type PlanInfo = { plan: 'Basic' | 'Pro' | 'Elite'; limit: string }
 
 function resolvePlan(priceId?: string, productId?: string): PlanInfo | undefined {
-  const entries: Array<[keyof typeof ENV_IDS, string]> = Object.entries(ENV_IDS) as any
+  const entries = Object.entries(ENV_IDS) as Array<[keyof typeof ENV_IDS, string]>
   for (const [label, id] of entries) {
     if (id?.startsWith('price_') && priceId && id === priceId) {
       if (label === 'Basic') return { plan: 'Basic', limit: '10' }
@@ -31,20 +33,16 @@ function resolvePlan(priceId?: string, productId?: string): PlanInfo | undefined
   return undefined
 }
 
-export const runtime = 'nodejs'
-
 export async function POST(req: NextRequest) {
   const sig = req.headers.get('stripe-signature')
   if (!sig) return NextResponse.json({ error: 'Missing signature' }, { status: 400 })
 
-  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET!
-  const body = await req.text()
+  const rawBody = await req.text()
 
   let event: Stripe.Event
   try {
-    event = stripe.webhooks.constructEvent(body, sig, webhookSecret)
+    event = stripe.webhooks.constructEvent(rawBody, sig, process.env.STRIPE_WEBHOOK_SECRET!)
   } catch (err: any) {
-    console.error('Webhook signature verification failed', err?.message)
     return NextResponse.json({ error: `Webhook Error: ${err.message}` }, { status: 400 })
   }
 
@@ -52,11 +50,12 @@ export async function POST(req: NextRequest) {
     if (event.type === 'checkout.session.completed') {
       const session = event.data.object as Stripe.Checkout.Session
 
-      const email = session.customer_details?.email || undefined
+      const email = session.customer_details?.email ?? undefined
 
-      // fetch subscription to get both price and product IDs
+      // Pull both price and product from the subscription
       let priceId: string | undefined
       let productId: string | undefined
+
       if (session.mode === 'subscription' && session.subscription) {
         const sub = await stripe.subscriptions.retrieve(session.subscription as string, {
           expand: ['items.data.price.product'],
@@ -68,10 +67,10 @@ export async function POST(req: NextRequest) {
       }
 
       const mapping = resolvePlan(priceId, productId)
-
       if (!email || !mapping) {
+        // Return 200 so Stripe stops retrying; we just log and exit.
         console.warn('Missing email or mapping', { email, priceId, productId })
-        return NextResponse.json({ received: true, note: 'Missing email or mapping' }, { status: 200 })
+        return NextResponse.json({ received: true }, { status: 200 })
       }
 
       const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!)
@@ -88,10 +87,12 @@ export async function POST(req: NextRequest) {
         )
 
       if (error) {
-        console.error('Supabase upsert error', error)
         return NextResponse.json({ error: 'Supabase upsert failed' }, { status: 500 })
       }
     }
 
     return NextResponse.json({ received: true }, { status: 200 })
-  } cat
+  } catch (err: any) {
+    return NextResponse.json({ error: 'Internal webhook handler error' }, { status: 500 })
+  }
+}
