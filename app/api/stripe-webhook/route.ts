@@ -50,7 +50,19 @@ export async function POST(req: NextRequest) {
     if (event.type === 'checkout.session.completed') {
       const session = event.data.object as Stripe.Checkout.Session
 
-      const email = session.customer_details?.email ?? undefined
+      let email = session.customer_details?.email || undefined
+
+// fallback #1 (older field still sent sometimes)
+if (!email && (session as any).customer_email) {
+  email = (session as any).customer_email as string
+}
+
+// fallback #2 (fetch the Customer)
+if (!email && session.customer) {
+  const cust = await stripe.customers.retrieve(session.customer as string)
+  if (!('deleted' in cust) && cust.email) email = cust.email
+}
+
 
       // Pull both price and product from the subscription
       let priceId: string | undefined
