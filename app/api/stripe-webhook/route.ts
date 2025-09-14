@@ -1,101 +1,128 @@
 // app/api/stripe-webhook/route.ts
-import { NextRequest, NextResponse } from 'next/server'
+import { NextResponse } from 'next/server'
 import Stripe from 'stripe'
 import { createClient } from '@supabase/supabase-js'
 
-export const runtime = 'nodejs' // use Node runtime for Stripe SDK
+export const runtime = 'nodejs'
+export const dynamic = 'force-dynamic'
 
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, { apiVersion: '2024-06-20' })
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
+  apiVersion: '2024-06-20',
+})
 
-// Map the client’s Price IDs -> plan + daily limits
+// Map Price IDs → plan/limit (use the EXACT price IDs from Vercel env)
 const PRICE_TO_PLAN: Record<string, { plan: 'Basic' | 'Pro' | 'Elite'; limit: string }> = {
   [process.env.PRICE_BASIC!]: { plan: 'Basic', limit: '10' },
   [process.env.PRICE_PRO!]:   { plan: 'Pro',   limit: '30' },
   [process.env.PRICE_ELITE!]: { plan: 'Elite', limit: 'unlimited' },
 }
 
-async function resolveEmailAndPrice(session: Stripe.Checkout.Session) {
-  // Start with the email Stripe gives us on the session
-  let email = session.customer_details?.email || undefined
-
-  // Prefer subscription item price for subscriptions
-  let priceId: string | undefined
-  if (session.mode === 'subscription' && session.subscription) {
-    const sub = await stripe.subscriptions.retrieve(session.subscription as string, {
-      expand: ['items.data.price'],
-    })
-    priceId = sub.items.data[0]?.price?.id
-
-    // If email was missing, try fetching the customer
-    if (!email && typeof session.customer === 'string') {
-      const cust = await stripe.customers.retrieve(session.customer)
-      if (!('deleted' in cust)) email = cust.email ?? undefined
-    }
-  } else {
-    // Fallback (rare): expand line_items on the session to find the price
-    const s = await stripe.checkout.sessions.retrieve(session.id, {
-      expand: ['line_items.data.price'],
-    })
-    const li = s.line_items?.data?.[0]
-    priceId = (li?.price as Stripe.Price | undefined)?.id
-    if (!email && s.customer_details?.email) email = s.customer_details.email
-  }
-
-  return { email, priceId }
+// optional helper if you later want to support product fallback
+function fromIds(priceId?: string | null, productId?: string | null) {
+  if (priceId && PRICE_TO_PLAN[priceId]) return PRICE_TO_PLAN[priceId]
+  return undefined
 }
 
-export async function POST(req: NextRequest) {
-  // Stripe signature header
-  const signature = req.headers.get('stripe-signature')
-  if (!signature) return NextResponse.json({ error: 'Missing signature' }, { status: 400 })
+export async function POST(req: Request) {
+  const sig = req.headers.get('stripe-signature')
+  if (!sig) return NextResponse.json({ error: 'Missing signature' }, { status: 400 })
 
-  // Raw body for verification
   const rawBody = await req.text()
 
-  // Verify signature
   let event: Stripe.Event
   try {
-    event = stripe.webhooks.constructEvent(rawBody, signature, process.env.STRIPE_WEBHOOK_SECRET!)
-  } catch (e: any) {
-    console.error('❌ Bad signature:', e?.message)
-    return NextResponse.json({ error: `Webhook Error: ${e.message}` }, { status: 400 })
+    event = stripe.webhooks.constructEvent(
+      rawBody,
+      sig,
+      process.env.STRIPE_WEBHOOK_SECRET!
+    )
+  } catch (err: any) {
+    console.error('Webhook signature failed:', err?.message)
+    return NextResponse.json({ error: `Webhook Error: ${err.message}` }, { status: 400 })
   }
 
   try {
-    if (event.type === 'checkout.session.completed') {
-      const session = event.data.object as Stripe.Checkout.Session
+    // Handle the events that happen on/after checkout
+    // (checkout.session.completed is enough for your flow, but we also handle the common follow-ups)
+    if (
+      event.type === 'checkout.session.completed' ||
+      event.type === 'customer.subscription.created' ||
+      event.type === 'customer.subscription.updated' ||
+      event.type === 'invoice.payment_succeeded'
+    ) {
+      const obj: any = event.data.object
 
-      const { email, priceId } = await resolveEmailAndPrice(session)
-      const mapping = priceId ? PRICE_TO_PLAN[priceId] : undefined
+      // 1) Get customer email (with fallbacks)
+      let email: string | undefined =
+        obj?.customer_details?.email ||
+        obj?.customer_email ||
+        undefined
+
+      if (!email && obj?.customer) {
+        // last resort: fetch the customer
+        const cust = await stripe.customers.retrieve(obj.customer as string)
+        if (!('deleted' in cust) && cust.email) email = cust.email
+      }
+
+      // 2) Determine the price (and optionally product) being paid for
+      let priceId: string | undefined
+      let productId: string | undefined
+
+      if (obj?.subscription) {
+        // checkout.session.completed / sub events
+        const sub = await stripe.subscriptions.retrieve(obj.subscription as string, {
+          expand: ['items.data.price.product'],
+        })
+        const item = sub.items.data[0]
+        priceId = item?.price?.id
+        const p = item?.price?.product
+        productId = typeof p === 'string' ? p : p?.id
+      } else if (obj?.lines?.data?.length) {
+        // invoices have lines
+        const item = obj.lines.data[0]
+        priceId = item?.price?.id
+        const p = item?.price?.product
+        productId = typeof p === 'string' ? p : p?.id
+      }
+
+      const mapping = fromIds(priceId, productId)
 
       if (!email || !mapping) {
-        console.warn('⚠️ Missing email or price mapping', { email, priceId })
-        // Return 200 so Stripe stops retrying; we just skip the update.
-        return NextResponse.json({ received: true }, { status: 200 })
+        console.log('WH: missing email or mapping', { email, priceId, productId, type: event.type })
+        return NextResponse.json({ received: true })
       }
 
-      // Update the existing user row (no upsert => no NOT NULL issues)
-      const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!)
+      // 3) Upsert into Supabase (create if not exists, otherwise update)
+      const supabase = createClient(
+        process.env.SUPABASE_URL!,
+        process.env.SUPABASE_SERVICE_ROLE_KEY!
+      )
+
+      const table = process.env.SUPABASE_USERS_TABLE || 'users'
+      const emailCol = process.env.SUPABASE_EMAIL_COLUMN || 'email'
+
       const { error } = await supabase
-        .from(process.env.SUPABASE_USERS_TABLE || 'users')
-        .update({
-          plan: mapping.plan,
-          daily_comp_limit: mapping.limit,
-        })
-        .eq(process.env.SUPABASE_EMAIL_COLUMN || 'email', email)
+        .from(table)
+        .upsert(
+          {
+            [emailCol]: email,
+            plan: mapping.plan,
+            daily_comp_limit: mapping.limit,
+          },
+          { onConflict: emailCol } // requires a unique index on the email column
+        )
 
       if (error) {
-        console.error('❌ Supabase update error:', error)
-        return NextResponse.json({ error: 'Supabase update failed' }, { status: 500 })
+        console.error('Supabase upsert error:', error)
+        return NextResponse.json({ error: 'Supabase upsert failed' }, { status: 500 })
       }
 
-      console.log('✅ Updated user', { email, plan: mapping.plan })
+      console.log('WH: upserted', { email, plan: mapping.plan, limit: mapping.limit })
     }
 
-    // Always 200 so Stripe doesn’t retry for other events we ignore
-    return NextResponse.json({ received: true }, { status: 200 })
-  } catch (e: any) {
-    console.error('❌ Handler error:', e)
-    return NextResponse.json({ error: 'Internal webhook handler error' }, { status: 500 })
+    return NextResponse.json({ received: true })
+  } catch (err: any) {
+    console.error('Webhook handler error:', err)
+    return NextResponse.json({ error: 'Internal webhook error' }, { status: 500 })
   }
 }
