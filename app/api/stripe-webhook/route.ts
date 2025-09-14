@@ -3,130 +3,153 @@ import { NextRequest, NextResponse } from 'next/server'
 import Stripe from 'stripe'
 import { createClient } from '@supabase/supabase-js'
 
-export const runtime = 'nodejs'
+export const runtime = 'nodejs' // ensure Node runtime (not edge) for raw body access
 
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, { apiVersion: '2024-06-20' })
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
+  apiVersion: '2024-06-20',
+})
 
-// Map Price IDs -> plan & limits
-const PRICE_TO_PLAN: Record<string, { plan: 'Basic' | 'Pro' | 'Elite'; limit: string }> = {
-  [process.env.PRICE_BASIC!]: { plan: 'Basic', limit: '10' },
-  [process.env.PRICE_PRO!]:   { plan: 'Pro',   limit: '30' },
-  [process.env.PRICE_ELITE!]: { plan: 'Elite', limit: 'unlimited' },
+/**
+ * Map your Prices (or Products) to plan + limit.
+ * Prefer using Price IDs (price_...) from Stripe, but this also supports prod_... if needed.
+ */
+const ENV_IDS = {
+  Basic: process.env.PRICE_BASIC!, // e.g. price_XXXX
+  Pro: process.env.PRICE_PRO!,     // e.g. price_YYYY
+  Elite: process.env.PRICE_ELITE!, // e.g. price_ZZZZ
 }
 
-async function updateSupabaseByEmail(email: string, priceId?: string | null) {
-  if (!email || !priceId) return { skipped: 'missing email or priceId', email, priceId }
+type PlanInfo = { plan: 'Basic' | 'Pro' | 'Elite'; limit: string }
 
-  const mapping = PRICE_TO_PLAN[priceId]
-  if (!mapping) return { skipped: 'unknown price id', email, priceId }
+function resolvePlan(priceId?: string, productId?: string): PlanInfo | undefined {
+  // Check explicit price matches first
+  if (priceId) {
+    if (priceId === ENV_IDS.Basic) return { plan: 'Basic', limit: '10' }
+    if (priceId === ENV_IDS.Pro)   return { plan: 'Pro',   limit: '30' }
+    if (priceId === ENV_IDS.Elite) return { plan: 'Elite', limit: 'unlimited' }
+  }
 
-  const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!)
+  // Optional product fallback if you ever supply prod_... instead of price_...
+  if (productId) {
+    if (productId === ENV_IDS.Basic) return { plan: 'Basic', limit: '10' }
+    if (productId === ENV_IDS.Pro)   return { plan: 'Pro',   limit: '30' }
+    if (productId === ENV_IDS.Elite) return { plan: 'Elite', limit: 'unlimited' }
+  }
 
-  // Upsert by email so it works whether the row exists or not
-  const { error } = await supabase
-    .from(process.env.SUPABASE_USERS_TABLE || 'users')
-    .upsert(
-      {
-        [process.env.SUPABASE_EMAIL_COLUMN || 'email']: email,
-        plan: mapping.plan,
-        daily_comp_limit: mapping.limit,
-      },
-      { onConflict: process.env.SUPABASE_EMAIL_COLUMN || 'email' }
-    )
+  return undefined
+}
 
-  if (error) throw error
-  return { ok: true, email, ...mapping }
+async function getEmailFromSession(session: Stripe.Checkout.Session): Promise<string | undefined> {
+  // 1) Normal place for the email:
+  if (session.customer_details?.email) return session.customer_details.email
+
+  // 2) Legacy/older field sometimes present:
+  // @ts-expect-error: legacy field occasionally exists on some sessions
+  if (session.customer_email && typeof session.customer_email === 'string') {
+    // @ts-ignore
+    return session.customer_email as string
+  }
+
+  // 3) As a final fallback, fetch the Stripe customer record
+  if (session.customer) {
+    const cust = await stripe.customers.retrieve(session.customer as string)
+    if (!('deleted' in cust) && cust.email) return cust.email
+  }
+
+  return undefined
 }
 
 export async function POST(req: NextRequest) {
   const sig = req.headers.get('stripe-signature')
-  if (!sig) return NextResponse.json({ error: 'Missing signature' }, { status: 400 })
+  if (!sig) {
+    return NextResponse.json({ error: 'Missing signature' }, { status: 400 })
+  }
 
-  const body = await req.text()
+  const rawBody = await req.text()
   let event: Stripe.Event
 
   try {
-    event = stripe.webhooks.constructEvent(body, sig, process.env.STRIPE_WEBHOOK_SECRET!)
+    event = stripe.webhooks.constructEvent(
+      rawBody,
+      sig,
+      process.env.STRIPE_WEBHOOK_SECRET!
+    )
   } catch (err: any) {
-    console.error('Webhook signature verify failed:', err?.message)
+    console.error('Webhook signature verification failed:', err?.message)
     return NextResponse.json({ error: `Webhook Error: ${err.message}` }, { status: 400 })
   }
 
   try {
-    switch (event.type) {
-      /**
-       * Primary path when using Checkout
-       */
-      case 'checkout.session.completed': {
-        const s = event.data.object as Stripe.Checkout.Session
+    // We only need to act on successful checkout completion to tag the user.
+    if (event.type === 'checkout.session.completed') {
+      const session = event.data.object as Stripe.Checkout.Session
 
-        // Email
-        let email = s.customer_details?.email || null
-        if (!email && s.customer) {
-          const cust = await stripe.customers.retrieve(s.customer as string)
-          if (!('deleted' in cust)) email = cust.email ?? null
-        }
+      const email = await getEmailFromSession(session)
 
-        // Price
-        let priceId: string | null = null
-        if (s.mode === 'subscription' && s.subscription) {
-          const sub = await stripe.subscriptions.retrieve(s.subscription as string, { expand: ['items.data.price'] })
-          priceId = sub.items.data[0]?.price?.id ?? null
-        }
+      // Identify the subscribed price/product
+      let priceId: string | undefined
+      let productId: string | undefined
 
-        const res = await updateSupabaseByEmail(email!, priceId)
-        console.log('WH update (checkout.session.completed):', { event: event.id, ...res })
-        break
+      if (session.mode === 'subscription' && session.subscription) {
+        // Expand subscription items to read price + product
+        const sub = await stripe.subscriptions.retrieve(session.subscription as string, {
+          expand: ['items.data.price.product'],
+        })
+        const item = sub.items.data[0]
+        priceId = item?.price?.id
+
+        const prod = item?.price?.product as string | Stripe.Product | undefined
+        productId = typeof prod === 'string' ? prod : prod?.id
       }
 
-      /**
-       * Backup paths (your endpoint is receiving these now)
-       * We read subscription & customer to get priceId + email, then update.
-       */
-      case 'customer.subscription.created':
-      case 'customer.subscription.updated':
-      case 'invoice.payment_succeeded': {
-        let subscriptionId: string | null = null
-        let customerId: string | null = null
+      const mapping = resolvePlan(priceId, productId)
 
-        const obj: any = event.data.object
-        if (obj.object === 'subscription') {
-          const sub = obj as Stripe.Subscription
-          subscriptionId = sub.id
-          customerId = typeof sub.customer === 'string' ? sub.customer : sub.customer.id
-        } else if (obj.object === 'invoice') {
-          const inv = obj as Stripe.Invoice
-          subscriptionId = typeof inv.subscription === 'string' ? inv.subscription : null
-          customerId = typeof inv.customer === 'string' ? inv.customer : null
-        }
-
-        // Email
-        let email: string | null = null
-        if (customerId) {
-          const cust = await stripe.customers.retrieve(customerId)
-          if (!('deleted' in cust)) email = cust.email ?? null
-        }
-
-        // Price
-        let priceId: string | null = null
-        if (subscriptionId) {
-          const sub = await stripe.subscriptions.retrieve(subscriptionId, { expand: ['items.data.price'] })
-          priceId = sub.items.data[0]?.price?.id ?? null
-        }
-
-        const res = await updateSupabaseByEmail(email!, priceId)
-        console.log('WH update (sub/invoice):', { event: event.id, type: event.type, ...res })
-        break
+      if (!email || !mapping) {
+        console.warn('Stripe webhook: missing email or plan mapping', { email, priceId, productId })
+        // Always return 200 so Stripe stops retrying; we just log for visibility.
+        return NextResponse.json({ received: true, note: 'missing email or mapping' }, { status: 200 })
       }
 
-      default:
-        // Not needed for tagging
-        console.log('WH ignore:', event.type)
+      // Supabase (Service Role bypasses RLS)
+      const supabase = createClient(
+        process.env.SUPABASE_URL!,
+        process.env.SUPABASE_SERVICE_ROLE_KEY!
+      )
+
+      const table = process.env.SUPABASE_USERS_TABLE || 'users'
+      const emailCol = process.env.SUPABASE_EMAIL_COLUMN || 'email'
+
+      // IMPORTANT: UPDATE by email (no upsert) to avoid NOT NULL password_hash issue.
+      const { data, error } = await supabase
+        .from(table)
+        .update({
+          plan: mapping.plan,
+          daily_comp_limit: mapping.limit,
+        })
+        .eq(emailCol, email)
+        .select(emailCol) // returns [] if no match
+
+      if (error) {
+        console.error('Supabase UPDATE failed:', error)
+        return NextResponse.json({ error: 'Supabase update failed' }, { status: 500 })
+      }
+
+      if (!data?.length) {
+        // Row didn’t exist; that’s OK (we’re not inserting by design).
+        console.warn('Supabase UPDATE: no row matched this email; nothing updated', { table, emailCol, email })
+      }
     }
 
+    // Acknowledge all events (including the ones we ignore) so Stripe doesn’t retry.
     return NextResponse.json({ received: true }, { status: 200 })
   } catch (err: any) {
-    console.error('Webhook processing error:', err?.message || err)
+    console.error('Webhook handler error:', err)
     return NextResponse.json({ error: 'Internal webhook handler error' }, { status: 500 })
   }
+}
+
+// For older Next runtimes, this ensures raw body is preserved.
+// Safe to keep even in App Router.
+export const config = {
+  api: { bodyParser: false },
 }
